@@ -1,0 +1,22 @@
+[workspace]
+name = "grism_simulations"
+channels = ["conda-forge"]
+platforms = ["osx-64"]
+
+[dependencies]
+python = "3.12.*"
+numpy = "*"
+scipy = "*"
+astropy = "*"
+pandas = "*"
+matplotlib = "*"
+jax = "*"
+asdf = "*"
+tqdm = "*"
+jupyter = "*"
+ipykernel = "*"
+asdf-astropy = ">=0.11.0,<0.12"
+
+[pypi-dependencies]
+pystellibs = { git = "https://github.com/mfouesneau/pystellibs.git" }
+grismagic = { path = "../grismagic", editable = true }
