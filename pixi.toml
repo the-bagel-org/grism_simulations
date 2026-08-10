@@ -3,6 +3,9 @@ name = "grism_simulations"
 channels = ["conda-forge"]
 platforms = ["osx-64"]
 
+[activation.env]
+STPSF_PATH = "/Users/momcheva/dev/stpsf-data"
+
 [dependencies]
 python = "3.12.*"
 numpy = "*"
@@ -20,3 +23,4 @@ asdf-astropy = ">=0.11.0,<0.12"
 [pypi-dependencies]
 pystellibs = { git = "https://github.com/mfouesneau/pystellibs.git" }
 grismagic = { path = "../grismagic", editable = true }
+stpsf = ">=2.1.0, <3"

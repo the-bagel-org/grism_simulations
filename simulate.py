@@ -1,19 +1,26 @@
 """Forward-simulate JWST NIRISS GR150C direct and dispersed (WFSS) images.
 
-Sources are 2D Gaussians randomly placed on the 2048x2048 detector, each with
-a spectral shape drawn at random from the pystellibs Kurucz library. Traces
-come from the CRDS specwcs reference files via grismagic; fluxes are weighted
-by the aXe-style first-order sensitivity curves.
+Point sources are randomly placed on the 2048x2048 detector, each with a
+spectral shape drawn at random from the pystellibs Kurucz library. Their spatial
+profile is either a 2D Gaussian (default) or a realistic, field-dependent NIRISS
+PSF from stpsf (``psf=True``). Traces come from the CRDS specwcs reference files
+via grismagic; fluxes are weighted by the aXe-style first-order sensitivity
+curves.
 
 Intended for use from notebooks::
 
     from simulate import simulate
-    results, catalog = simulate(n_sources=200, seed=42)
+    results, catalog = simulate(n_sources=200, seed=42)            # Gaussian
+    results, catalog = simulate(n_sources=200, seed=42, psf=True)  # NIRISS PSF
 """
 
 import datetime
 import os
 import subprocess
+
+# Point stpsf at its reference-data bundle before it is imported (the import is
+# deferred into the PSF functions, but the env var must be set beforehand).
+os.environ.setdefault("STPSF_PATH", "/Users/momcheva/dev/stpsf-data")
 
 import jax
 
@@ -34,6 +41,9 @@ from grismagic.traces import GrismTrace
 
 CONF_DIR = "/Users/momcheva/dev/grizli_conf/CONF"
 FOV = 2048
+
+# Where field-dependent stpsf PSF grids are cached (one .npz per filter+params).
+PSF_CACHE_DIR = os.path.expanduser("~/.cache/grismagic/psf_grids")
 
 # Highest-numbered GR150C specwcs reference per filter in CONF_DIR
 SPECWCS_FILES = {
@@ -195,16 +205,19 @@ def compute_trace_weights(lam_um, spec_lam_AA, spec_flux, amp, sens_interp):
 
 def build_dispersed_image(
     trace, order, x, y, amps, spec_lam_AA, source_spectra, sens_interp,
-    stamp, shape=(FOV, FOV),
+    stamps, shape=(FOV, FOV),
 ):
     """Disperse all sources for one order into a single image.
 
-    Returns (image, per-source total counts).
+    ``stamps`` is either one (S, S) stamp shared by all sources, or a per-source
+    stack (n, S, S) (e.g. position-dependent PSFs). Returns (image, per-source
+    total counts).
     """
     offsets = global_offset_grid(trace, order, fov=shape[0])
     disperse_jit = jax.jit(disperse_obj, static_argnames=("chunk_size",))
     output = jnp.zeros(shape)
-    stamp_j = jnp.asarray(stamp)
+    per_source = np.ndim(stamps) == 3
+    shared_stamp = None if per_source else jnp.asarray(stamps)
     fluxes = np.zeros(len(x))
 
     for i, (xi, yi, ai) in enumerate(zip(x, y, amps)):
@@ -215,10 +228,113 @@ def build_dispersed_image(
         yt = np.where(good, yt, 0.0)
         w = np.where(good, w, 0.0)
         fluxes[i] = w.sum()
+        stamp_j = jnp.asarray(stamps[i]) if per_source else shared_stamp
         output = disperse_jit(
             stamp_j, xi, yi, jnp.asarray(xt), jnp.asarray(yt), jnp.asarray(w), output
         )
     return np.asarray(output), fluxes
+
+
+def build_direct_image_from_stamps(x, y, fluxes, stamps, shape=(FOV, FOV)):
+    """Direct image by placing per-source stamps at subpixel (x, y).
+
+    Uses the same bilinear scatter as the disperser (a single trace point per
+    source), so placement and flux are consistent with the dispersed image.
+    ``stamps`` may be one shared (S, S) stamp or a per-source (n, S, S) stack.
+    """
+    disperse_jit = jax.jit(disperse_obj, static_argnames=("chunk_size",))
+    output = jnp.zeros(shape)
+    per_source = np.ndim(stamps) == 3
+    shared_stamp = None if per_source else jnp.asarray(stamps)
+
+    for i, (xi, yi, fi) in enumerate(zip(x, y, fluxes)):
+        stamp_j = jnp.asarray(stamps[i]) if per_source else shared_stamp
+        output = disperse_jit(
+            stamp_j, xi, yi,
+            jnp.asarray([xi]), jnp.asarray([yi]), jnp.asarray([float(fi)]), output,
+        )
+    return np.asarray(output)
+
+
+def build_psf_grid(
+    filt, num=3, fov_pixels=25, oversample=4, nlambda=3,
+    cache_dir=PSF_CACHE_DIR, fov=FOV,
+):
+    """Field-dependent NIRISS PSF grid: ``num`` x ``num`` detector positions.
+
+    Each grid point is a detector-sampled, distortion-included PSF (stpsf
+    ``DET_DIST``) normalized to unit sum. Cached to a per-filter .npz so repeat
+    runs are instant. Returns (gx, gy, stamps[num, num, S, S]).
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+    key = f"niriss_{filt}_n{num}_fov{fov_pixels}_os{oversample}_nl{nlambda}.npz"
+    path = os.path.join(cache_dir, key)
+    if os.path.exists(path):
+        d = np.load(path)
+        return d["gx"], d["gy"], d["stamps"]
+
+    import stpsf
+
+    nis = stpsf.NIRISS()
+    nis.filter = filt
+    gx = np.linspace(0, fov - 1, num)
+    gy = np.linspace(0, fov - 1, num)
+    stamps = np.zeros((num, num, fov_pixels, fov_pixels))
+    for iy, yy in enumerate(gy):
+        for ix, xx in enumerate(gx):
+            nis.detector_position = (float(xx), float(yy))
+            psf = nis.calc_psf(
+                fov_pixels=fov_pixels, oversample=oversample, nlambda=nlambda
+            )
+            det = psf["DET_DIST"].data
+            stamps[iy, ix] = det / det.sum()
+    np.savez(path, gx=gx, gy=gy, stamps=stamps)
+    return gx, gy, stamps
+
+
+def psf_stamp_at(gx, gy, stamps, xi, yi):
+    """Bilinearly interpolate the PSF grid to detector position (xi, yi)."""
+    fx = np.clip(np.interp(xi, gx, np.arange(len(gx))), 0, len(gx) - 1)
+    fy = np.clip(np.interp(yi, gy, np.arange(len(gy))), 0, len(gy) - 1)
+    x0 = int(np.floor(fx)); x1 = min(x0 + 1, len(gx) - 1); dx = fx - x0
+    y0 = int(np.floor(fy)); y1 = min(y0 + 1, len(gy) - 1); dy = fy - y0
+    s = (
+        (1 - dx) * (1 - dy) * stamps[y0, x0]
+        + dx * (1 - dy) * stamps[y0, x1]
+        + (1 - dx) * dy * stamps[y1, x0]
+        + dx * dy * stamps[y1, x1]
+    )
+    return s / s.sum()
+
+
+def source_psf_stamps(
+    filt, x, y, num=3, fov_pixels=25, oversample=4, nlambda=3,
+    exact=False, cache_dir=PSF_CACHE_DIR,
+):
+    """Per-source, position-matched unit PSF stamps for one filter.
+
+    Default interpolates a cached ``num`` x ``num`` grid (fast). ``exact=True``
+    computes a fresh stpsf PSF at every source position (accurate but slow:
+    one PSF calc per source).
+    """
+    if exact:
+        import stpsf
+
+        nis = stpsf.NIRISS()
+        nis.filter = filt
+        out = np.zeros((len(x), fov_pixels, fov_pixels))
+        for i, (xi, yi) in enumerate(tqdm(list(zip(x, y)), desc=f"PSF {filt}")):
+            nis.detector_position = (float(xi), float(yi))
+            det = nis.calc_psf(
+                fov_pixels=fov_pixels, oversample=oversample, nlambda=nlambda
+            )["DET_DIST"].data
+            out[i] = det / det.sum()
+        return out
+
+    gx, gy, grid = build_psf_grid(
+        filt, num, fov_pixels, oversample, nlambda, cache_dir
+    )
+    return np.stack([psf_stamp_at(gx, gy, grid, xi, yi) for xi, yi in zip(x, y)])
 
 
 def write_fits(path, image, header_cards):
@@ -240,6 +356,13 @@ def simulate(
     target_R=140,
     conf_dir=CONF_DIR,
     specwcs_files=None,
+    psf=False,
+    psf_num=3,
+    psf_fov=25,
+    psf_oversample=4,
+    psf_nlambda=3,
+    psf_exact=False,
+    psf_cache_dir=PSF_CACHE_DIR,
     outdir="output",
     write=True,
 ):
@@ -247,6 +370,13 @@ def simulate(
 
     results[filt]['direct'] and results[filt]['dispersed'] are 2048x2048 arrays;
     the dispersed image is the sum over the requested orders.
+
+    Source spatial profile:
+      * ``psf=False`` (default): 2D Gaussian of FWHM ``fwhm`` pixels.
+      * ``psf=True``: realistic NIRISS PSF from stpsf, matched to each source's
+        detector position via a cached ``psf_num`` x ``psf_num`` field grid
+        (``psf_exact=True`` computes a fresh PSF per source instead). One PSF per
+        filter (no wavelength variation along the trace). ``fwhm`` is unused.
     """
     specwcs = dict(SPECWCS_FILES)
     if specwcs_files:
@@ -257,7 +387,7 @@ def simulate(
         n_sources, seed, len(spectra), border=border, amp_range=amp_range
     )
     source_spectra = spectra[kurucz_idx]
-    stamp = unit_gaussian_stamp(fwhm, stamp_size)
+    gaussian_stamp = None if psf else unit_gaussian_stamp(fwhm, stamp_size)
 
     catalog = Table(
         {
@@ -280,13 +410,23 @@ def simulate(
         specwcs_path = os.path.join(conf_dir, specwcs[filt])
         trace = GrismTrace.from_crds(specwcs_path, filter_name=filt)
 
+        # Position-matched PSF stamps for this filter, or the shared Gaussian.
+        if psf:
+            stamps = source_psf_stamps(
+                filt, x, y, num=psf_num, fov_pixels=psf_fov,
+                oversample=psf_oversample, nlambda=psf_nlambda,
+                exact=psf_exact, cache_dir=psf_cache_dir,
+            )
+        else:
+            stamps = gaussian_stamp
+
         dispersed = np.zeros((FOV, FOV))
         for order in orders:
             sens_interp, sens_path = load_sensitivity(filt, order, conf_dir)
             sens_paths[f"{filt}_{order}"] = sens_path
             img, fluxes = build_dispersed_image(
                 trace, order, x, y, amps, spec_lam_AA, source_spectra,
-                sens_interp, stamp,
+                sens_interp, stamps,
             )
             dispersed += img
             tag = ORDER_SENS_TAG[order]
@@ -306,7 +446,12 @@ def simulate(
                 ).sum()
             catalog[f"flux_{filt}"] = fluxes
 
-        direct = build_direct_image(x, y, catalog[f"flux_{filt}"], fwhm=fwhm)
+        if psf:
+            direct = build_direct_image_from_stamps(
+                x, y, catalog[f"flux_{filt}"], stamps
+            )
+        else:
+            direct = build_direct_image(x, y, catalog[f"flux_{filt}"], fwhm=fwhm)
         results[filt] = {"direct": direct, "dispersed": dispersed, "trace": trace}
 
     try:
@@ -323,8 +468,20 @@ def simulate(
             "n_sources": n_sources,
             "border": border,
             "amp_range": list(amp_range),
-            "fwhm_pix": fwhm,
-            "stamp_size": stamp_size,
+            "profile": "stpsf_niriss" if psf else "gaussian",
+            "fwhm_pix": "n/a (PSF)" if psf else fwhm,
+            "stamp_size": psf_fov if psf else stamp_size,
+            "psf": (
+                {
+                    "source": "stpsf.NIRISS DET_DIST",
+                    "field_grid": "per-source (exact)" if psf_exact
+                    else f"{psf_num}x{psf_num} interpolated",
+                    "fov_pixels": psf_fov,
+                    "oversample": psf_oversample,
+                    "nlambda": psf_nlambda,
+                }
+                if psf else None
+            ),
             "target_R": target_R,
             "grism": "GR150C",
             "orders": list(orders),
@@ -350,7 +507,8 @@ def simulate(
                 "GRISM": "GR150C",
                 "SEED": seed,
                 "NSOURCES": n_sources,
-                "FWHM": fwhm,
+                "PROFILE": "stpsf_niriss" if psf else "gaussian",
+                "FWHM": 0.0 if psf else fwhm,
                 "ORDERS": ",".join(orders),
                 "SPECWCS": specwcs[filt],
             }
